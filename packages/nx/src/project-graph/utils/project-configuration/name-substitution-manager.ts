@@ -59,6 +59,9 @@ export class ProjectNameInNodePropsManager {
   private getNameMap: () => Record<string, ProjectConfiguration>;
   private allRefs = new Set<RootRef | UsageRef>();
   private pendingByName = new Map<string, Set<RootRef | UsageRef>>();
+  // name → root for every name a project has ever been identified by, so refs
+  // to a since-renamed name still bind to the right root (see createRef).
+  private nameHistory = new Map<string, string>();
 
   constructor(getNameMap?: () => Record<string, ProjectConfiguration>) {
     this.getNameMap = getNameMap ?? (() => ({}));
@@ -194,14 +197,20 @@ export class ProjectNameInNodePropsManager {
     }
   }
 
-  // Builds a sentinel and registers it.
+  // Builds a sentinel and registers it. When `referencedName` isn't in the
+  // current name map, fall back to the rename history: a batch may reference a
+  // project by a name that a project earlier in the same batch already renamed
+  // (refs register after the whole batch merges), and the old name still
+  // identifies the same root.
   private createRef(
     referencedName: string,
     parent: unknown,
     key: string | undefined,
     targetPart?: string
   ): RootRef | UsageRef {
-    const referencedRoot = this.getNameMap()[referencedName]?.root;
+    const referencedRoot =
+      this.getNameMap()[referencedName]?.root ??
+      this.nameHistory.get(referencedName);
     const ref: RootRef | UsageRef =
       referencedRoot !== undefined
         ? new RootRef(referencedRoot, parent, key, targetPart)
@@ -225,6 +234,12 @@ export class ProjectNameInNodePropsManager {
   // RootRef by prototype swap. Sentinel identity across spread copies means
   // one promotion updates every array the sentinel reached.
   identifyProjectWithRoot(root: string, name: string): void {
+    // Every name a root has ever gone by, including pre-rename names. A later
+    // ref to a stale name resolves to the root it identified at the time.
+    // (If two roots use the same name over a graph construction, the later
+    // one wins — matching how the live name map would have resolved it.)
+    this.nameHistory.set(name, root);
+
     const pending = this.pendingByName.get(name);
     if (!pending) return;
     this.pendingByName.delete(name);
@@ -258,6 +273,7 @@ export class ProjectNameInNodePropsManager {
 
     this.allRefs.clear();
     this.pendingByName.clear();
+    this.nameHistory.clear();
   }
 
   private resolveFinalName(
