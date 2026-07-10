@@ -2,12 +2,30 @@ jest.mock('./deduce-default-base', () => ({
   deduceDefaultBase: jest.fn(() => 'main'),
 }));
 
-import { mkdtempSync, rmSync } from 'fs';
+jest.mock('../../../utils/package-manager', () => ({
+  ...jest.requireActual('../../../utils/package-manager'),
+  detectPackageManager: jest.fn(() => 'pnpm'),
+  getPackageManagerVersion: jest.fn(() => '11.10.0'),
+}));
+
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { parse } from 'yaml';
 import { NxJsonConfiguration, TargetDefaults } from '../../../config/nx-json';
 import { readJsonFile, writeJsonFile } from '../../../utils/fileutils';
 import {
+  detectPackageManager,
+  getPackageManagerVersion,
+} from '../../../utils/package-manager';
+import {
+  approveNxBuildScriptForPnpm,
   createNxJsonFile,
   createNxJsonFromTurboJson,
   extractErrorName,
@@ -403,6 +421,157 @@ describe('utils', () => {
       expect(readErrorStderr({})).toBe('');
       expect(readErrorStderr(null)).toBe('');
       expect(readErrorStderr({ stderr: null })).toBe('');
+    });
+
+    it('includes stdout, where package managers print their error codes', () => {
+      expect(readErrorStderr({ stdout: 'ERR_PNPM_IGNORED_BUILDS' })).toBe(
+        'ERR_PNPM_IGNORED_BUILDS'
+      );
+      expect(readErrorStderr({ stderr: 'boom', stdout: 'details' })).toBe(
+        'boom\ndetails'
+      );
+    });
+  });
+
+  describe('approveNxBuildScriptForPnpm', () => {
+    let repoRoot: string;
+    const workspaceYaml = () => join(repoRoot, 'pnpm-workspace.yaml');
+
+    beforeEach(() => {
+      repoRoot = mkdtempSync(join(tmpdir(), 'nx-init-approve-builds-'));
+      (detectPackageManager as jest.Mock).mockReturnValue('pnpm');
+      (getPackageManagerVersion as jest.Mock).mockReturnValue('11.10.0');
+    });
+
+    afterEach(() => {
+      rmSync(repoRoot, { recursive: true, force: true });
+    });
+
+    it('creates pnpm-workspace.yaml with allowBuilds.nx for pnpm >= 11', () => {
+      approveNxBuildScriptForPnpm(repoRoot);
+
+      expect(parse(readFileSync(workspaceYaml(), 'utf-8'))).toEqual({
+        allowBuilds: { nx: true },
+      });
+    });
+
+    it('overwrites the placeholder pnpm scaffolds after a failed install, preserving other entries and comments', () => {
+      writeFileSync(
+        workspaceYaml(),
+        [
+          '# team notes',
+          'allowBuilds:',
+          '  nx: set this to true or false',
+          '  sharp: false',
+          'packages:',
+          "  - 'apps/*'",
+          '',
+        ].join('\n')
+      );
+
+      approveNxBuildScriptForPnpm(repoRoot);
+
+      const contents = readFileSync(workspaceYaml(), 'utf-8');
+      expect(contents).toContain('# team notes');
+      expect(parse(contents)).toEqual({
+        allowBuilds: { nx: true, sharp: false },
+        packages: ['apps/*'],
+      });
+    });
+
+    it('migrates ignoredBuiltDependencies to allowBuilds: false entries for pnpm >= 11', () => {
+      writeFileSync(
+        workspaceYaml(),
+        [
+          'allowBuilds:',
+          '  nx: set this to true or false',
+          '  sharp: set this to true or false',
+          'ignoredBuiltDependencies:',
+          '  - sharp',
+          '  - unrs-resolver',
+          '',
+        ].join('\n')
+      );
+
+      approveNxBuildScriptForPnpm(repoRoot);
+
+      expect(parse(readFileSync(workspaceYaml(), 'utf-8'))).toEqual({
+        allowBuilds: { nx: true, sharp: false, 'unrs-resolver': false },
+        ignoredBuiltDependencies: ['sharp', 'unrs-resolver'],
+      });
+    });
+
+    it('does not override explicit boolean allowBuilds entries during migration', () => {
+      writeFileSync(
+        workspaceYaml(),
+        [
+          'allowBuilds:',
+          '  sharp: true',
+          'ignoredBuiltDependencies:',
+          '  - sharp',
+          '',
+        ].join('\n')
+      );
+
+      approveNxBuildScriptForPnpm(repoRoot);
+
+      expect(parse(readFileSync(workspaceYaml(), 'utf-8'))).toEqual({
+        allowBuilds: { nx: true, sharp: true },
+        ignoredBuiltDependencies: ['sharp'],
+      });
+    });
+
+    it('does not migrate ignoredBuiltDependencies for pnpm 10, where it is still the native mechanism', () => {
+      (getPackageManagerVersion as jest.Mock).mockReturnValue('10.18.0');
+      writeFileSync(
+        workspaceYaml(),
+        ['ignoredBuiltDependencies:', '  - sharp', ''].join('\n')
+      );
+
+      approveNxBuildScriptForPnpm(repoRoot);
+
+      expect(parse(readFileSync(workspaceYaml(), 'utf-8'))).toEqual({
+        ignoredBuiltDependencies: ['sharp'],
+        onlyBuiltDependencies: ['nx'],
+      });
+    });
+
+    it('appends nx to onlyBuiltDependencies for pnpm 10, without duplicating', () => {
+      (getPackageManagerVersion as jest.Mock).mockReturnValue('10.18.0');
+      writeFileSync(
+        workspaceYaml(),
+        ['onlyBuiltDependencies:', '  - esbuild', ''].join('\n')
+      );
+
+      approveNxBuildScriptForPnpm(repoRoot);
+      approveNxBuildScriptForPnpm(repoRoot);
+
+      expect(parse(readFileSync(workspaceYaml(), 'utf-8'))).toEqual({
+        onlyBuiltDependencies: ['esbuild', 'nx'],
+      });
+    });
+
+    it('does nothing for pnpm < 10 or other package managers', () => {
+      (getPackageManagerVersion as jest.Mock).mockReturnValue('9.15.9');
+      approveNxBuildScriptForPnpm(repoRoot);
+      expect(existsSync(workspaceYaml())).toBe(false);
+
+      (detectPackageManager as jest.Mock).mockReturnValue('npm');
+      (getPackageManagerVersion as jest.Mock).mockReturnValue('11.10.0');
+      approveNxBuildScriptForPnpm(repoRoot);
+      expect(existsSync(workspaceYaml())).toBe(false);
+    });
+
+    it('leaves the file untouched when nx is already approved or the file is malformed', () => {
+      const approved = 'allowBuilds:\n  nx: true\n';
+      writeFileSync(workspaceYaml(), approved);
+      approveNxBuildScriptForPnpm(repoRoot);
+      expect(readFileSync(workspaceYaml(), 'utf-8')).toBe(approved);
+
+      const malformed = '- just\n- a\n- list\n';
+      writeFileSync(workspaceYaml(), malformed);
+      approveNxBuildScriptForPnpm(repoRoot);
+      expect(readFileSync(workspaceYaml(), 'utf-8')).toBe(malformed);
     });
   });
 

@@ -1,5 +1,6 @@
 import { execSync } from 'child_process';
 import { join } from 'path';
+import { Document, parseDocument, Scalar, YAMLMap, YAMLSeq } from 'yaml';
 
 import {
   NxJsonConfiguration,
@@ -14,7 +15,9 @@ import {
 import { output } from '../../../utils/output';
 import { PackageJson } from '../../../utils/package-json';
 import {
+  detectPackageManager,
   getPackageManagerCommand,
+  getPackageManagerVersion,
   PackageManagerCommands,
 } from '../../../utils/package-manager';
 import { joinPathFragments } from '../../../utils/path';
@@ -300,17 +303,134 @@ export function runInstall(
   repoRoot: string,
   pmc: PackageManagerCommands = getPackageManagerCommand()
 ) {
+  approveNxBuildScriptForPnpm(repoRoot);
   try {
     execSync(pmc.install, {
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
       cwd: repoRoot,
       windowsHide: true,
     });
   } catch (e) {
-    if ((e as any)?.stderr) process.stderr.write((e as any).stderr);
+    // Package managers put the actionable failure on their own streams —
+    // pnpm, for one, prints its ERR_PNPM_* codes and their remedies to
+    // stdout. Re-emit both streams and fold them into the error message so
+    // error logs and telemetry name the real cause instead of a bare
+    // "Command failed".
+    const stdout = streamToString((e as any)?.stdout);
+    const stderr = streamToString((e as any)?.stderr);
+    if (stderr) process.stderr.write(stderr);
+    if (stdout) process.stderr.write(stdout);
+    if (e instanceof Error) {
+      e.message = [e.message, stdout, stderr].filter(Boolean).join('\n');
+    }
     throw e;
   }
+}
+
+/**
+ * pnpm >= 10 refuses to run dependency build scripts unless they are
+ * explicitly approved, and nx has a postinstall script. As of pnpm 11 an
+ * unapproved build script fails the install outright (ERR_PNPM_IGNORED_BUILDS)
+ * with instructions to run the interactive `pnpm approve-builds` — which
+ * would eject the user from the init/import flow with no cue to come back.
+ * Since nx is the dependency these flows add, approve nx's own build script
+ * ahead of the install. Approving any other package's scripts remains the
+ * user's decision.
+ */
+export function approveNxBuildScriptForPnpm(repoRoot: string): void {
+  try {
+    if (detectPackageManager(repoRoot) !== 'pnpm') {
+      return;
+    }
+    const major = parseInt(
+      getPackageManagerVersion('pnpm', repoRoot).split('.')[0],
+      10
+    );
+    if (!(major >= 10)) {
+      return;
+    }
+    const path = join(repoRoot, 'pnpm-workspace.yaml');
+    const raw = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+    const parsed = parseDocument(raw);
+    // A present root that isn't a mapping is malformed for pnpm; bail rather
+    // than clobber the user's file.
+    if (parsed.contents != null && !(parsed.contents instanceof YAMLMap)) {
+      return;
+    }
+    const doc =
+      parsed.contents instanceof YAMLMap ? parsed : new Document(new YAMLMap());
+
+    if (major >= 11) {
+      // pnpm 11 reads approvals from the allowBuilds map — an install fails
+      // for ANY dependency with build scripts that has no boolean entry
+      // there, including packages the user already opted out of via the
+      // pnpm 10 mechanism, ignoredBuiltDependencies. So in addition to
+      // approving nx, migrate the user's existing opt-outs to
+      // `allowBuilds: <pkg>: false` entries. Setting a value also overwrites
+      // the "set this to true or false" placeholders pnpm scaffolds after a
+      // failed install.
+      const allowBuilds = doc.get('allowBuilds');
+      if (allowBuilds != null && !(allowBuilds instanceof YAMLMap)) {
+        return;
+      }
+      const updates: Record<string, boolean> = {};
+      const configured = (name: string): unknown =>
+        allowBuilds instanceof YAMLMap ? allowBuilds.get(name) : undefined;
+      if (configured('nx') !== true) {
+        updates['nx'] = true;
+      }
+      const ignored = doc.get('ignoredBuiltDependencies');
+      if (ignored instanceof YAMLSeq) {
+        for (const item of ignored.items) {
+          const name =
+            item instanceof Scalar ? String(item.value) : String(item);
+          if (name !== 'nx' && typeof configured(name) !== 'boolean') {
+            updates[name] = false;
+          }
+        }
+      }
+      if (Object.keys(updates).length === 0) {
+        return;
+      }
+      if (allowBuilds instanceof YAMLMap) {
+        for (const [name, value] of Object.entries(updates)) {
+          doc.setIn(['allowBuilds', name], value);
+        }
+      } else {
+        doc.set('allowBuilds', updates);
+      }
+    } else {
+      // pnpm 10 reads approvals from the onlyBuiltDependencies list.
+      const seq = doc.get('onlyBuiltDependencies');
+      if (seq != null && !(seq instanceof YAMLSeq)) {
+        return;
+      }
+      if (seq instanceof YAMLSeq) {
+        const values = seq.items.map((item) =>
+          item instanceof Scalar ? String(item.value) : String(item)
+        );
+        if (values.includes('nx')) {
+          return;
+        }
+        seq.add('nx');
+      } else {
+        doc.set('onlyBuiltDependencies', ['nx']);
+      }
+    }
+    writeFileSync(path, doc.toString());
+  } catch {
+    // Best-effort: if this fails, the install may still hit pnpm's
+    // approve-builds gate — whose guidance runInstall now passes through.
+  }
+}
+
+function streamToString(raw: unknown): string {
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof (raw as Buffer).toString === 'function') {
+    return (raw as Buffer).toString('utf8');
+  }
+  return '';
 }
 
 /**
@@ -337,12 +457,13 @@ export function toErrorString(error: unknown): string {
 }
 
 export function readErrorStderr(error: unknown): string {
-  const raw = (error as any)?.stderr;
-  if (typeof raw === 'string') return raw;
-  if (raw && typeof (raw as Buffer).toString === 'function') {
-    return (raw as Buffer).toString('utf8');
-  }
-  return '';
+  // stdout is included as a fallback: package managers (e.g. pnpm) print
+  // their error codes and remedies to stdout, and extractErrorName greps
+  // this text for E*/ERR_* codes.
+  return [(error as any)?.stderr, (error as any)?.stdout]
+    .map(streamToString)
+    .filter(Boolean)
+    .join('\n');
 }
 
 export function extractErrorName(error: unknown, stderr: string): string {
