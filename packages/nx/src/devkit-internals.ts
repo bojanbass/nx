@@ -65,3 +65,4 @@ export {
   resolvePrompt,
   PromptResolutionError,
 } from './command-line/migrate/prompt-files';
+export { acknowledgePnpmBuildScripts } from './utils/pnpm-allow-builds';
