@@ -3980,7 +3980,12 @@ snapshots:
       } as any);
 
       // Neither pruning nor stringifying may throw on the path mismatch.
-      const prunedGraph = pruneProjectGraph(graph, packageJson);
+      const prunedGraph = pruneProjectGraph(
+        graph,
+        packageJson,
+        undefined,
+        'pnpm'
+      );
       const result = stringifyPnpmLockfile(
         prunedGraph,
         lockFile,
